@@ -2,10 +2,11 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title='豊さんの株式ヒートマップ',layout='wide')
-st.title('日本株・売買代金ヒートマップ【Ver.5】')
+st.title('日本株・売買代金ヒートマップ【Ver.9】')
 st.caption('無料データを利用。売買代金とその前日比は日足の終値×出来高による概算です。リアルタイムではありません。')
 
 DEFAULT = '''半導体,8035,東京エレクトロン
@@ -115,7 +116,7 @@ with st.sidebar:
     st.caption('暫定100銘柄です。前回リストと異なる場合はここで編集できます。編集後「データ更新」を押してください。')
     run = st.button('🔄 データ更新',type='primary',use_container_width=True)
 
-@st.cache_data(ttl=900,show_spinner=False)
+@st.cache_data(ttl=300,show_spinner=False)
 def fetch(raw):
     items=[]
     for line in raw.splitlines():
@@ -149,69 +150,99 @@ def fetch(raw):
             errors.append(f'{code} {name}: {e}')
     return pd.DataFrame(records),errors
 
-if run:
-    fetch.clear()
-with st.spinner('株価データを取得しています…'):
-    df,errors=fetch(raw)
-if df.empty:
-    st.error('データを取得できませんでした。ネット接続や銘柄コードを確認して、再度更新してください。')
-else:
-    latest=', '.join(sorted(df['日付'].unique()))
-    st.caption(f'取得した取引日: {latest} ／ 表示銘柄: {len(df)} ／ 更新操作時刻: {datetime.now():%Y-%m-%d %H:%M}')
-    st.info('マスの面積＝概算売買代金、赤＝株価上昇、緑＝株価下落。金額と前日比は終値×出来高の概算です。複数セクターにある銘柄は重複集計されます。')
-    # ランキングは同一コードの重複を除外（セクター別の集計は従来仕様）。
-    unique_df=df.drop_duplicates(subset=['コード']).copy()
-    # 3つのランキングを横並びでコンパクトに表示。
-    min_value=st.sidebar.number_input('ランキング対象の最低概算売買代金（億円）',min_value=0.0,value=1.0,step=1.0)
-    sector_rank=df.groupby('セクター',as_index=False)[['概算売買代金(億円)','前営業日概算売買代金(億円)']].sum()
-    sector_rank['代金増減%']=(sector_rank['概算売買代金(億円)']/sector_rank['前営業日概算売買代金(億円)']-1)*100
-    sector_rank=sector_rank.nlargest(10,'概算売買代金(億円)')
-    eligible=unique_df[unique_df['概算売買代金(億円)']>=min_value]
-    top_volume=eligible.nlargest(10,'売買代金前日比(%)')
-    both=eligible[(eligible['騰落率(%)']>0)&(eligible['売買代金前日比(%)']>0)].copy()
-    if not both.empty:
-        both['株価順位']=both['騰落率(%)'].rank(ascending=False,method='min')
-        both['代金順位']=both['売買代金前日比(%)'].rank(ascending=False,method='min')
-        both['総合順位スコア']=both['株価順位']+both['代金順位']
-        both=both.sort_values(['総合順位スコア','概算売買代金(億円)'],ascending=[True,False]).head(10)
-    left,mid,right=st.columns(3,gap='small')
-    with left:
-        st.markdown('**📊 セクター売買代金 TOP10**')
-        show=sector_rank[['セクター','概算売買代金(億円)','代金増減%']].copy()
-        show.columns=['セクター','億円','前日比%']
-        st.dataframe(show.style.format({'億円':'{:,.0f}','前日比%':'{:+.0f}%'}),hide_index=True,use_container_width=True,height=212)
-    with mid:
-        st.markdown('**🚀 売買代金増加 TOP10**')
-        show=top_volume[['銘柄','概算売買代金(億円)','売買代金前日比(%)']].copy()
-        show.columns=['銘柄','億円','前日比%']
-        st.dataframe(show.style.format({'億円':'{:,.1f}','前日比%':'{:+.0f}%'}),hide_index=True,use_container_width=True,height=212)
-    with right:
-        st.markdown('**🔥 株価上昇＋代金増加 TOP10**')
-        if both.empty:
-            st.info('該当銘柄なし')
-        else:
-            show=both[['銘柄','騰落率(%)','売買代金前日比(%)']].copy()
-            show.columns=['銘柄','株価%','代金%']
-            st.dataframe(show.style.format({'株価%':'{:+.1f}%','代金%':'{:+.0f}%'}),hide_index=True,use_container_width=True,height=212)
-    st.caption('ランキングは登録銘柄のみ。銘柄ランキングは重複除外、セクター合計は複数所属銘柄を各セクターに計上。売買代金は概算でリアルタイムではありません。')
-    st.subheader('🟥 セクター別ヒートマップ')
-    df['表示']=(df['銘柄']+'<br>'+df['騰落率(%)'].map(lambda x:f'{x:+.2f}%')+'<br>'+df['概算売買代金(億円)'].map(lambda x:f'{x:,.1f}億円')+'<br>'+df['売買代金前日比(%)'].map(lambda x:f'代金前日比 {x:+.1f}%'))
-    df['色']=df['騰落率(%)'].apply(lambda x:'上昇' if x>0 else ('下落' if x<0 else '変わらず'))
-    # Discrete red/green scheme is standard in Japanese markets.
-    fig=px.treemap(df,path=[px.Constant('全銘柄'),'セクター','表示'],values='概算売買代金(億円)',color='色',
-        color_discrete_map={'上昇':'#c93838','下落':'#16835a','変わらず':'#777777'},
-        custom_data=['コード','終値','概算売買代金(億円)','騰落率(%)','日付','前営業日概算売買代金(億円)','売買代金前日比(%)'])
-    fig.update_traces(textinfo='label',hovertemplate='銘柄: %{label}<br>コード: %{customdata[0]}<br>終値: %{customdata[1]:,.1f}円<br>概算売買代金: %{customdata[2]:,.1f}億円<br>騰落率: %{customdata[3]:+.2f}%<br>前営業日概算代金: %{customdata[5]:,.1f}億円<br>売買代金前日比: %{customdata[6]:+.1f}%<br>日付: %{customdata[4]}<extra></extra>',root_color='#181818')
-    fig.update_layout(height=680,margin=dict(t=5,l=5,r=5,b=5),font=dict(size=15))
-    st.plotly_chart(fig,use_container_width=True)
-    st.caption('前日比＝（直近営業日の概算売買代金 ÷ 前営業日の概算売買代金 − 1）×100。休場日には直近の取引日を使用します。小さいマスでは文字が省略されるため、マウスを重ねて詳細を確認してください。')
-    st.subheader('セクター別・概算売買代金ランキング')
-    rank=df.groupby('セクター',as_index=False)[['概算売買代金(億円)','前営業日概算売買代金(億円)']].sum()
-    rank['売買代金前日比(%)']=(rank['概算売買代金(億円)']/rank['前営業日概算売買代金(億円)']-1)*100
-    rank=rank.sort_values('概算売買代金(億円)',ascending=False)
-    st.dataframe(rank,use_container_width=True,hide_index=True)
-    st.download_button('取得データをCSV保存',df.drop(columns=['表示','色']).to_csv(index=False).encode('utf-8-sig'),'heatmap_data.csv','text/csv')
-if errors:
-    with st.expander(f'取得できなかった銘柄・注意事項（{len(errors)}件）'):
-        st.write('\n'.join(errors))
-st.caption('投資判断の前に証券会社の正式な売買代金・株価を確認してください。')
+JST = ZoneInfo('Asia/Tokyo')
+
+def is_trading_hours(now):
+    t = now.time()
+    return now.weekday() < 5 and (time(9, 0) <= t < time(11, 30) or time(12, 30) <= t < time(15, 30))
+
+@st.fragment(run_every="5min")
+def display_heatmap():
+    now = datetime.now(JST)
+    market_open = is_trading_hours(now)
+    # Automatic fetch is restricted to weekday session hours; holidays may still be included.
+    last_fetch = st.session_state.get('heatmap_last_fetch')
+    needs_fetch = (st.session_state.get('heatmap_raw') != raw
+                   or 'heatmap_df' not in st.session_state
+                   or run
+                   or (market_open and (last_fetch is None or (now - last_fetch) >= timedelta(minutes=5))))
+    if needs_fetch:
+        if run:
+            fetch.clear()
+        with st.spinner('株価データを取得しています…'):
+            df, errors = fetch(raw)
+        st.session_state['heatmap_df'] = df
+        st.session_state['heatmap_errors'] = errors
+        st.session_state['heatmap_last_fetch'] = datetime.now(JST)
+        st.session_state['heatmap_raw'] = raw
+    else:
+        df = st.session_state['heatmap_df']
+        errors = st.session_state['heatmap_errors']
+    stamp = st.session_state['heatmap_last_fetch'].strftime('%Y-%m-%d %H:%M:%S')
+    st.caption(f"🔄 最終データ取得操作: {stamp}（日本時間） ／ 自動更新: {'取引時間内・5分間隔' if market_open else '取引時間外・停止中'}")
+
+    if df.empty:
+        st.error('データを取得できませんでした。ネット接続や銘柄コードを確認して、再度更新してください。')
+    else:
+        latest=', '.join(sorted(df['日付'].unique()))
+        st.caption(f'取得した取引日: {latest} ／ 表示銘柄: {len(df)} ／ データ取得操作時刻: {stamp}')
+        st.info('マスの面積＝概算売買代金、赤＝株価上昇、緑＝株価下落。金額と前日比は終値×出来高の概算です。複数セクターにある銘柄は重複集計されます。')
+        # ランキングは同一コードの重複を除外（セクター別の集計は従来仕様）。
+        unique_df=df.drop_duplicates(subset=['コード']).copy()
+        # 3つのランキングを横並びでコンパクトに表示。
+        min_value=st.sidebar.number_input('ランキング対象の最低概算売買代金（億円）',min_value=0.0,value=1.0,step=1.0)
+        sector_rank=df.groupby('セクター',as_index=False)[['概算売買代金(億円)','前営業日概算売買代金(億円)']].sum()
+        sector_rank['代金増減%']=(sector_rank['概算売買代金(億円)']/sector_rank['前営業日概算売買代金(億円)']-1)*100
+        sector_rank=sector_rank.nlargest(10,'概算売買代金(億円)')
+        eligible=unique_df[unique_df['概算売買代金(億円)']>=min_value]
+        top_volume=eligible.nlargest(10,'売買代金前日比(%)')
+        both=eligible[(eligible['騰落率(%)']>0)&(eligible['売買代金前日比(%)']>0)].copy()
+        if not both.empty:
+            both['株価順位']=both['騰落率(%)'].rank(ascending=False,method='min')
+            both['代金順位']=both['売買代金前日比(%)'].rank(ascending=False,method='min')
+            both['総合順位スコア']=both['株価順位']+both['代金順位']
+            both=both.sort_values(['総合順位スコア','概算売買代金(億円)'],ascending=[True,False]).head(10)
+        left,mid,right=st.columns(3,gap='small')
+        with left:
+            st.markdown('**📊 セクター売買代金 TOP10**')
+            show=sector_rank[['セクター','概算売買代金(億円)','代金増減%']].copy()
+            show.columns=['セクター','億円','前日比%']
+            st.dataframe(show.style.format({'億円':'{:,.0f}','前日比%':'{:+.0f}%'}),hide_index=True,use_container_width=True,height=212)
+        with mid:
+            st.markdown('**🚀 売買代金増加 TOP10**')
+            show=top_volume[['銘柄','概算売買代金(億円)','売買代金前日比(%)']].copy()
+            show.columns=['銘柄','億円','前日比%']
+            st.dataframe(show.style.format({'億円':'{:,.1f}','前日比%':'{:+.0f}%'}),hide_index=True,use_container_width=True,height=212)
+        with right:
+            st.markdown('**🔥 株価上昇＋代金増加 TOP10**')
+            if both.empty:
+                st.info('該当銘柄なし')
+            else:
+                show=both[['銘柄','騰落率(%)','売買代金前日比(%)']].copy()
+                show.columns=['銘柄','株価%','代金%']
+                st.dataframe(show.style.format({'株価%':'{:+.1f}%','代金%':'{:+.0f}%'}),hide_index=True,use_container_width=True,height=212)
+        st.caption('ランキングは登録銘柄のみ。銘柄ランキングは重複除外、セクター合計は複数所属銘柄を各セクターに計上。売買代金は概算でリアルタイムではありません。')
+        st.subheader('🟥 セクター別ヒートマップ')
+        df['表示']=(df['銘柄']+'<br>'+df['騰落率(%)'].map(lambda x:f'{x:+.2f}%')+'<br>'+df['概算売買代金(億円)'].map(lambda x:f'{x:,.1f}億円')+'<br>'+df['売買代金前日比(%)'].map(lambda x:f'代金前日比 {x:+.1f}%'))
+        df['色']=df['騰落率(%)'].apply(lambda x:'上昇' if x>0 else ('下落' if x<0 else '変わらず'))
+        # Discrete red/green scheme is standard in Japanese markets.
+        fig=px.treemap(df,path=[px.Constant('全銘柄'),'セクター','表示'],values='概算売買代金(億円)',color='色',
+            color_discrete_map={'上昇':'#c93838','下落':'#16835a','変わらず':'#777777'},
+            custom_data=['コード','終値','概算売買代金(億円)','騰落率(%)','日付','前営業日概算売買代金(億円)','売買代金前日比(%)'])
+        fig.update_traces(textinfo='label',hovertemplate='銘柄: %{label}<br>コード: %{customdata[0]}<br>終値: %{customdata[1]:,.1f}円<br>概算売買代金: %{customdata[2]:,.1f}億円<br>騰落率: %{customdata[3]:+.2f}%<br>前営業日概算代金: %{customdata[5]:,.1f}億円<br>売買代金前日比: %{customdata[6]:+.1f}%<br>日付: %{customdata[4]}<extra></extra>',root_color='#181818')
+        fig.update_layout(height=680,margin=dict(t=5,l=5,r=5,b=5),font=dict(size=15))
+        st.plotly_chart(fig,use_container_width=True)
+        st.caption('前日比＝（直近営業日の概算売買代金 ÷ 前営業日の概算売買代金 − 1）×100。休場日には直近の取引日を使用します。小さいマスでは文字が省略されるため、マウスを重ねて詳細を確認してください。')
+        st.subheader('セクター別・概算売買代金ランキング')
+        rank=df.groupby('セクター',as_index=False)[['概算売買代金(億円)','前営業日概算売買代金(億円)']].sum()
+        rank['売買代金前日比(%)']=(rank['概算売買代金(億円)']/rank['前営業日概算売買代金(億円)']-1)*100
+        rank=rank.sort_values('概算売買代金(億円)',ascending=False)
+        st.dataframe(rank,use_container_width=True,hide_index=True)
+        st.download_button('取得データをCSV保存',df.drop(columns=['表示','色']).to_csv(index=False).encode('utf-8-sig'),'heatmap_data.csv','text/csv')
+    if errors:
+        with st.expander(f'取得できなかった銘柄・注意事項（{len(errors)}件）'):
+            st.write('\n'.join(errors))
+    st.caption('投資判断の前に証券会社の正式な売買代金・株価を確認してください。')
+
+# Initial display; the fragment re-runs while the browser session is connected.
+display_heatmap()
