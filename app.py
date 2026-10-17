@@ -6,8 +6,8 @@ from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title='豊さんの株式ヒートマップ',layout='wide')
-st.title('日本株・売買代金ヒートマップ【Ver.9】')
-st.caption('無料データを利用。売買代金とその前日比は日足の終値×出来高による概算です。リアルタイムではありません。')
+st.title('日本株・売買代金ヒートマップ【Ver.10】')
+st.caption('無料データを利用。売買代金は概算で、リアルタイムではありません。5分足も遅延・欠損する場合があります。')
 
 DEFAULT = '''半導体,8035,東京エレクトロン
 半導体,6857,アドバンテスト
@@ -150,6 +150,83 @@ def fetch(raw):
             errors.append(f'{code} {name}: {e}')
     return pd.DataFrame(records),errors
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_intraday(raw):
+    """Free 5-minute bars: use two consecutive completed bars in the same session."""
+    entries = {}
+    for line in raw.splitlines():
+        parts = [v.strip() for v in line.split(',')]
+        if len(parts) == 3 and len(parts[1]) == 4 and parts[1].isdigit():
+            entries[parts[1]] = parts[2]
+    if not entries:
+        return pd.DataFrame(), '銘柄登録なし'
+    tickers = [f'{code}.T' for code in entries]
+    try:
+        data = yf.download(tickers, period='5d', interval='5m', auto_adjust=False,
+                           progress=False, threads=True, group_by='ticker')
+    except Exception as exc:
+        return pd.DataFrame(), f'5分足の取得に失敗: {exc}'
+    now = datetime.now(ZoneInfo('Asia/Tokyo'))
+    records = []
+    for code, name in entries.items():
+        try:
+            ticker = f'{code}.T'
+            frame = data[ticker] if isinstance(data.columns, pd.MultiIndex) else data
+            frame = frame.dropna(subset=['Close', 'Volume']).copy()
+            if frame.empty:
+                continue
+            index = pd.to_datetime(frame.index)
+            index = index.tz_localize('Asia/Tokyo') if index.tz is None else index.tz_convert('Asia/Tokyo')
+            frame.index = index
+            # Exclude the still-forming candle, stale bars and lunch/session boundaries.
+            frame = frame[frame.index + pd.Timedelta(minutes=5) <= pd.Timestamp(now)]
+            if len(frame) < 2:
+                continue
+            current, previous = frame.iloc[-1], frame.iloc[-2]
+            t1, t0 = frame.index[-1], frame.index[-2]
+            if t1.date() != now.date() or t0.date() != t1.date():
+                continue
+            if t1 - t0 != pd.Timedelta(minutes=5):
+                continue
+            if (pd.Timestamp(now) - t1) > pd.Timedelta(minutes=20):
+                continue
+            value = float(current['Close']) * float(current['Volume']) / 1e8
+            prev_value = float(previous['Close']) * float(previous['Volume']) / 1e8
+            if prev_value <= 0 or value <= 0:
+                continue
+            change = (value / prev_value - 1) * 100
+            records.append({'コード':code, '銘柄':name, '5分代金(億円)':value,
+                            '5分代金増加率(%)':change, '足時刻':t1.strftime('%H:%M')})
+        except Exception:
+            continue
+    return pd.DataFrame(records), None
+
+
+def show_mobile_table(data, formats=None):
+    """HTML table has no internal scroll; whole page scrolls on phones."""
+    import html
+    if data.empty:
+        st.info('該当データなし')
+        return
+    formats = formats or {}
+    headers = ''.join(f'<th>{html.escape(str(c))}</th>' for c in data.columns)
+    rows = []
+    for _, record in data.iterrows():
+        cells = []
+        for col in data.columns:
+            val = record[col]
+            fmt = formats.get(col)
+            shown = fmt.format(val) if fmt and pd.notna(val) else str(val)
+            cells.append(f'<td>{html.escape(shown)}</td>')
+        rows.append('<tr>' + ''.join(cells) + '</tr>')
+    st.markdown("""<style>
+    .rank-table{width:100%;border-collapse:collapse;table-layout:auto;font-size:clamp(11px,2.8vw,15px)}
+    .rank-table th,.rank-table td{padding:9px 5px;border-bottom:1px solid #aaa5;text-align:right;white-space:normal;overflow-wrap:anywhere}
+    .rank-table th:first-child,.rank-table td:first-child{text-align:left;width:48%}
+    .rank-table th{background:rgba(130,130,130,.10)}
+    </style>""" + '<table class="rank-table"><thead><tr>' + headers +
+                '</tr></thead><tbody>' + ''.join(rows) + '</tbody></table>', unsafe_allow_html=True)
+
 JST = ZoneInfo('Asia/Tokyo')
 
 def is_trading_hours(now):
@@ -202,25 +279,40 @@ def display_heatmap():
             both['代金順位']=both['売買代金前日比(%)'].rank(ascending=False,method='min')
             both['総合順位スコア']=both['株価順位']+both['代金順位']
             both=both.sort_values(['総合順位スコア','概算売買代金(億円)'],ascending=[True,False]).head(10)
-        left,mid,right=st.columns(3,gap='small')
-        with left:
-            st.markdown('**📊 セクター売買代金 TOP10**')
-            show=sector_rank[['セクター','概算売買代金(億円)','代金増減%']].copy()
-            show.columns=['セクター','億円','前日比%']
-            st.dataframe(show.style.format({'億円':'{:,.0f}','前日比%':'{:+.0f}%'}),hide_index=True,use_container_width=True,height=212)
-        with mid:
-            st.markdown('**🚀 売買代金増加 TOP10**')
-            show=top_volume[['銘柄','概算売買代金(億円)','売買代金前日比(%)']].copy()
-            show.columns=['銘柄','億円','前日比%']
-            st.dataframe(show.style.format({'億円':'{:,.1f}','前日比%':'{:+.0f}%'}),hide_index=True,use_container_width=True,height=212)
-        with right:
-            st.markdown('**🔥 株価上昇＋代金増加 TOP10**')
-            if both.empty:
-                st.info('該当銘柄なし')
+        st.markdown('### 🔥 資金流入・初動発見 TOP10')
+        intraday, intraday_error = fetch_intraday(raw)
+        if intraday.empty:
+            st.info('当日の連続した確定5分足が取得できません。休場日・寄り付き直後・無料データの遅延時は表示されません。')
+        else:
+            merged = intraday.merge(unique_df[['コード','騰落率(%)']], on='コード', how='left')
+            candidates = merged[(merged['騰落率(%)'] >= 1) &
+                                (merged['騰落率(%)'] <= 3) &
+                                (merged['5分代金増加率(%)'] >= 100)].copy()
+            candidates = candidates.sort_values(['5分代金増加率(%)','5分代金(億円)'],ascending=False).head(10)
+            if candidates.empty:
+                st.info('条件に合う銘柄はありません（株価+1〜3%、5分代金増加率+100%以上）。')
             else:
-                show=both[['銘柄','騰落率(%)','売買代金前日比(%)']].copy()
-                show.columns=['銘柄','株価%','代金%']
-                st.dataframe(show.style.format({'株価%':'{:+.1f}%','代金%':'{:+.0f}%'}),hide_index=True,use_container_width=True,height=212)
+                show = candidates[['銘柄','騰落率(%)','5分代金増加率(%)']].copy()
+                show.columns = ['銘柄','株価%','5分代金%']
+                show_mobile_table(show, {'株価%':'{:+.1f}%','5分代金%':'{:+.0f}%'})
+                st.caption('5分代金＝5分足終値×5分足出来高の概算。増加率は直前の確定5分足比。株価%は日足データであり、時刻が一致しない場合があります。')
+        if intraday_error:
+            st.caption(intraday_error)
+        st.markdown('### 📊 セクター売買代金 TOP10')
+        show=sector_rank[['セクター','概算売買代金(億円)','代金増減%']].copy()
+        show.columns=['セクター','億円','前日比%']
+        show_mobile_table(show, {'億円':'{:,.0f}','前日比%':'{:+.0f}%'})
+        st.markdown('### 🚀 売買代金増加 TOP10')
+        show=top_volume[['銘柄','概算売買代金(億円)','売買代金前日比(%)']].copy()
+        show.columns=['銘柄','億円','前日比%']
+        show_mobile_table(show, {'億円':'{:,.1f}','前日比%':'{:+.0f}%'})
+        st.markdown('### 📈 株価上昇＋代金増加 TOP10')
+        if both.empty:
+            st.info('該当銘柄なし')
+        else:
+            show=both[['銘柄','騰落率(%)','売買代金前日比(%)']].copy()
+            show.columns=['銘柄','株価%','代金%']
+            show_mobile_table(show, {'株価%':'{:+.1f}%','代金%':'{:+.0f}%'})
         st.caption('ランキングは登録銘柄のみ。銘柄ランキングは重複除外、セクター合計は複数所属銘柄を各セクターに計上。売買代金は概算でリアルタイムではありません。')
         st.subheader('🟥 セクター別ヒートマップ')
         df['表示']=(df['銘柄']+'<br>'+df['騰落率(%)'].map(lambda x:f'{x:+.2f}%')+'<br>'+df['概算売買代金(億円)'].map(lambda x:f'{x:,.1f}億円')+'<br>'+df['売買代金前日比(%)'].map(lambda x:f'代金前日比 {x:+.1f}%'))
