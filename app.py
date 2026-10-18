@@ -6,7 +6,7 @@ from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title='豊さんの株式ヒートマップ',layout='wide')
-st.title('日本株・売買代金ヒートマップ【Ver.10】')
+st.title('日本株・売買代金ヒートマップ【Ver.11】')
 st.caption('無料データを利用。売買代金は概算で、リアルタイムではありません。5分足も遅延・欠損する場合があります。')
 
 DEFAULT = '''半導体,8035,東京エレクトロン
@@ -152,7 +152,7 @@ def fetch(raw):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_intraday(raw):
-    """Free 5-minute bars: use two consecutive completed bars in the same session."""
+    """Estimate buy pressure from completed, same-session 5-minute bars."""
     entries = {}
     for line in raw.splitlines():
         parts = [v.strip() for v in line.split(',')]
@@ -160,43 +160,68 @@ def fetch_intraday(raw):
             entries[parts[1]] = parts[2]
     if not entries:
         return pd.DataFrame(), '銘柄登録なし'
-    tickers = [f'{code}.T' for code in entries]
     try:
-        data = yf.download(tickers, period='5d', interval='5m', auto_adjust=False,
-                           progress=False, threads=True, group_by='ticker')
+        data = yf.download([f'{c}.T' for c in entries], period='5d', interval='5m',
+                           auto_adjust=False, progress=False, threads=True, group_by='ticker')
     except Exception as exc:
         return pd.DataFrame(), f'5分足の取得に失敗: {exc}'
-    now = datetime.now(ZoneInfo('Asia/Tokyo'))
+    now = pd.Timestamp.now(tz='Asia/Tokyo')
     records = []
     for code, name in entries.items():
         try:
-            ticker = f'{code}.T'
-            frame = data[ticker] if isinstance(data.columns, pd.MultiIndex) else data
-            frame = frame.dropna(subset=['Close', 'Volume']).copy()
+            frame = data[f'{code}.T'] if isinstance(data.columns, pd.MultiIndex) else data
+            frame = frame.dropna(subset=['Open', 'High', 'Low', 'Close', 'Volume']).copy()
             if frame.empty:
                 continue
-            index = pd.to_datetime(frame.index)
-            index = index.tz_localize('Asia/Tokyo') if index.tz is None else index.tz_convert('Asia/Tokyo')
-            frame.index = index
-            # Exclude the still-forming candle, stale bars and lunch/session boundaries.
-            frame = frame[frame.index + pd.Timedelta(minutes=5) <= pd.Timestamp(now)]
-            if len(frame) < 2:
+            idx = pd.to_datetime(frame.index)
+            frame.index = idx.tz_localize('Asia/Tokyo') if idx.tz is None else idx.tz_convert('Asia/Tokyo')
+            frame = frame[(frame.index.date == now.date()) &
+                          (frame.index + pd.Timedelta(minutes=5) <= now)]
+            # Separate morning and afternoon; VWAP is reset at the start of each session.
+            if now.time() < time(12, 30):
+                frame = frame[(frame.index.time >= time(9, 0)) & (frame.index.time < time(11, 30))]
+            else:
+                frame = frame[(frame.index.time >= time(12, 30)) & (frame.index.time < time(15, 30))]
+            if len(frame) < 4 or (now - frame.index[-1]) > pd.Timedelta(minutes=20):
                 continue
-            current, previous = frame.iloc[-1], frame.iloc[-2]
-            t1, t0 = frame.index[-1], frame.index[-2]
-            if t1.date() != now.date() or t0.date() != t1.date():
+            # Require the last 4 bars to be consecutive (no lunch break or missing bars).
+            recent = frame.tail(4)
+            if not all(recent.index.to_series().diff().iloc[1:] == pd.Timedelta(minutes=5)):
                 continue
-            if t1 - t0 != pd.Timedelta(minutes=5):
+            volume = frame['Volume'].astype(float)
+            typical = (frame['High'] + frame['Low'] + frame['Close']) / 3
+            cumulative_vol = volume.cumsum()
+            if cumulative_vol.iloc[-1] <= 0:
                 continue
-            if (pd.Timestamp(now) - t1) > pd.Timedelta(minutes=20):
+            # Approximate VWAP from 5-minute typical prices; not trade-by-trade VWAP.
+            vwap = (typical * volume).cumsum() / cumulative_vol.replace(0, float('nan'))
+            last = recent.iloc[-1]
+            price = float(last['Close'])
+            vwap_now = float(vwap.iloc[-1])
+            if vwap_now <= 0 or price <= 0:
                 continue
-            value = float(current['Close']) * float(current['Volume']) / 1e8
-            prev_value = float(previous['Close']) * float(previous['Volume']) / 1e8
-            if prev_value <= 0 or value <= 0:
+            gap = (price / vwap_now - 1) * 100
+            last_vol = float(recent['Volume'].iloc[-1])
+            prev_vol = float(recent['Volume'].iloc[-2])
+            vol_change = (last_vol / prev_vol - 1) * 100 if prev_vol > 0 else None
+            if vol_change is None:
                 continue
-            change = (value / prev_value - 1) * 100
-            records.append({'コード':code, '銘柄':name, '5分代金(億円)':value,
-                            '5分代金増加率(%)':change, '足時刻':t1.strftime('%H:%M')})
+            # Intraday rise relative to first bar's open in the current session.
+            session_open = float(frame['Open'].iloc[0])
+            rise = (price / session_open - 1) * 100 if session_open > 0 else 0
+            bullish_count = int((recent['Close'] > recent['Open']).sum())
+            higher_lows = bool(recent['Low'].iloc[-1] > recent['Low'].iloc[-2] > recent['Low'].iloc[-3])
+            higher_highs = bool(recent['High'].iloc[-1] > recent['High'].iloc[-2] > recent['High'].iloc[-3])
+            # Fixed, transparent 100-point heuristic; not calibrated trading probabilities.
+            volume_score = 25 if vol_change >= 100 else (18 if vol_change >= 50 else (10 if vol_change >= 20 else 0))
+            vwap_score = 25 if gap > 0 and vwap.iloc[-1] > vwap.iloc[-2] else (15 if gap > 0 else 0)
+            price_score = 20 if 1 <= rise <= 3 else (12 if 0 < rise < 1 or 3 < rise <= 5 else 0)
+            candle_score = round(bullish_count / 4 * 15)
+            trend_score = 15 if higher_lows and higher_highs else (8 if higher_lows or higher_highs else 0)
+            score = volume_score + vwap_score + price_score + candle_score + trend_score
+            records.append({'コード': code, '銘柄': name, 'スコア': score,
+                            '株価%': rise, '出来高増加%': vol_change, 'VWAP乖離%': gap,
+                            '足時刻': recent.index[-1].strftime('%H:%M')})
         except Exception:
             continue
     return pd.DataFrame(records), None
@@ -279,25 +304,26 @@ def display_heatmap():
             both['代金順位']=both['売買代金前日比(%)'].rank(ascending=False,method='min')
             both['総合順位スコア']=both['株価順位']+both['代金順位']
             both=both.sort_values(['総合順位スコア','概算売買代金(億円)'],ascending=[True,False]).head(10)
-        st.markdown('### 🔥 資金流入・初動発見 TOP10')
+        st.markdown('### 🔥 買い圧力・初動発見 TOP10')
         intraday, intraday_error = fetch_intraday(raw)
         if intraday.empty:
-            st.info('当日の連続した確定5分足が取得できません。休場日・寄り付き直後・無料データの遅延時は表示されません。')
+            st.info('当日の連続した確定5分足が不足しています。休場日・寄り付き直後・無料データの遅延時は表示されません。')
         else:
-            merged = intraday.merge(unique_df[['コード','騰落率(%)']], on='コード', how='left')
-            candidates = merged[(merged['騰落率(%)'] >= 1) &
-                                (merged['騰落率(%)'] <= 3) &
-                                (merged['5分代金増加率(%)'] >= 100)].copy()
-            candidates = candidates.sort_values(['5分代金増加率(%)','5分代金(億円)'],ascending=False).head(10)
+            candidates = intraday[(intraday['VWAP乖離%'] > 0) & (intraday['株価%'] > 0)].copy()
+            candidates = candidates.sort_values(['スコア', '出来高増加%'], ascending=False).head(10)
             if candidates.empty:
-                st.info('条件に合う銘柄はありません（株価+1〜3%、5分代金増加率+100%以上）。')
+                st.info('VWAPより上かつセッション開始時より株価上昇の候補はありません。')
             else:
-                show = candidates[['銘柄','騰落率(%)','5分代金増加率(%)']].copy()
-                show.columns = ['銘柄','株価%','5分代金%']
-                show_mobile_table(show, {'株価%':'{:+.1f}%','5分代金%':'{:+.0f}%'})
-                st.caption('5分代金＝5分足終値×5分足出来高の概算。増加率は直前の確定5分足比。株価%は日足データであり、時刻が一致しない場合があります。')
+                show = candidates[['銘柄', 'スコア', '株価%', '出来高増加%', 'VWAP乖離%']]
+                show_mobile_table(show, {'スコア': '{:.0f}', '株価%': '{:+.1f}%',
+                                         '出来高増加%': '{:+.0f}%', 'VWAP乖離%': '{:+.1f}%'})
+                st.caption('足時刻（最新）: ' + ', '.join(sorted(candidates['足時刻'].unique())) +
+                           ' ／ 株価%は午前・午後それぞれの開始足始値比。出来高増加%は直前5分足比。')
         if intraday_error:
             st.caption(intraday_error)
+        st.caption('買い圧力スコアは推定値（出来高25・VWAP25・株価20・陽線15・高値安値15点）。'
+                   'VWAPは5分足の代表価格×出来高による概算で、実約定ベースのVWAPではありません。'
+                   '売買の買い・売り方向は判別できません。無料データは遅延・欠損します。')
         st.markdown('### 📊 セクター売買代金 TOP10')
         show=sector_rank[['セクター','概算売買代金(億円)','代金増減%']].copy()
         show.columns=['セクター','億円','前日比%']
