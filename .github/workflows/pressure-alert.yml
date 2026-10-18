@@ -1,0 +1,39 @@
+name: Buy pressure push alerts
+on:
+  schedule:
+    - cron: "*/5 * * * 1-5"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: buy-pressure-alert
+  cancel-in-progress: false
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Scan and notify
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          HEATMAP_URL: ${{ vars.HEATMAP_URL }}
+        run: python alert.py
+      - name: Persist ranking state
+        run: |
+          if [ -f .alert_state.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -f .alert_state.json
+            if ! git diff --cached --quiet; then
+              git commit -m "Update alert ranking state [skip ci]"
+              git push
+            fi
+          fi
